@@ -596,3 +596,192 @@ func main() {
 	agent := NewAgent("http://localhost:8080", computingPower)
 	agent.Start()
 }
+
+func TestOrchestratorEndpoints(t *testing.T) {
+	o := NewOrchestrator()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/calculate":
+			o.handleCalculate(w, r)
+		case r.URL.Path == "/api/v1/expressions":
+			o.handleGetExpressions(w, r)
+		case strings.HasPrefix(r.URL.Path, "/api/v1/expressions/"):
+			o.handleGetExpression(w, r)
+		case r.URL.Path == "/internal/task":
+			if r.Method == http.MethodGet {
+				o.handleGetTask(w, r)
+			} else {
+				o.handlePostTaskResult(w, r)
+			}
+		}
+	}))
+	defer ts.Close()
+
+	t.Run("TestCalculateHandler", func(t *testing.T) {
+		expr := `{"expression": "2 + 2 * 2"}`
+		resp, err := http.Post(ts.URL+"/api/v1/calculate", "application/json", bytes.NewBufferString(expr))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated {
+			t.Errorf("Expected status 201, got %d", resp.StatusCode)
+		}
+
+		var result struct{ ID string }
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatal(err)
+		}
+		if result.ID == "" {
+			t.Error("Expected non-empty ID")
+		}
+	})
+
+	t.Run("TestTaskProcessing", func(t *testing.T) {
+		// Add simple expression
+		expr := `{"expression": "3 + 4"}`
+		resp, _ := http.Post(ts.URL+"/api/v1/calculate", "application/json", bytes.NewBufferString(expr))
+		var exprResult struct{ ID string }
+		json.NewDecoder(resp.Body).Decode(&exprResult)
+		resp.Body.Close()
+
+		// Get task
+		resp, err := http.Get(ts.URL + "/internal/task")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		var taskResp struct {
+			Task struct {
+				ID     string      `json:"id"`
+				Arg1   interface{} `json:"arg1"`
+				Arg2   interface{} `json:"arg2"`
+				Operation string   `json:"operation"`
+			} `json:"task"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&taskResp); err != nil {
+			t.Fatal(err)
+		}
+
+		// Submit result
+		result := map[string]interface{}{"id": taskResp.Task.ID, "result": 7.0}
+		jsonData, _ := json.Marshal(result)
+		resp, _ = http.Post(ts.URL+"/internal/task", "application/json", bytes.NewBuffer(jsonData))
+		resp.Body.Close()
+
+		// Verify expression status
+		resp, _ = http.Get(ts.URL + "/api/v1/expressions/" + exprResult.ID)
+		var status struct {
+			Expression struct {
+				Status string  `json:"status"`
+				Result float64 `json:"result"`
+			} `json:"expression"`
+		}
+		json.NewDecoder(resp.Body).Decode(&status)
+		resp.Body.Close()
+
+		if status.Expression.Status != "done" || status.Expression.Result != 7.0 {
+			t.Errorf("Expected done status with result 7, got %s/%f", 
+				status.Expression.Status, status.Expression.Result)
+		}
+	})
+}
+
+func TestExpressionParsing(t *testing.T) {
+	tests := []struct {
+		name    string
+		expr    string
+		wantLen int
+		wantErr bool
+	}{
+		{"Simple", "2 + 3", 1, false},
+		{"Complex", "2 + 3 * 4", 2, false},
+		{"Invalid", "2 + * 3", 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tasks, err := parseExpression("test-id", tt.expr)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseExpression() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && len(tasks) != tt.wantLen {
+				t.Errorf("Expected %d tasks, got %d", tt.wantLen, len(tasks))
+			}
+		})
+	}
+}
+
+func TestAgentWorkflow(t *testing.T) {
+	// Mock orchestrator
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Write([]byte(`{"task":{"id":"test-task","arg1":5,"arg2":3,"operation":"+","operation_time":100}}`))
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	agent := NewAgent(ts.URL, 1)
+	
+	t.Run("TaskProcessing", func(t *testing.T) {
+		task, err := agent.getTask()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		result, err := agent.computeTask(task)
+		if err != nil || result != 8 {
+			t.Errorf("Expected result 8, got %f (err: %v)", result, err)
+		}
+
+		if err := agent.sendResult(task.ID, result); err != nil {
+			t.Errorf("Failed to send result: %v", err)
+		}
+	})
+}
+
+func TestStorageConcurrency(t *testing.T) {
+	storage := NewStorage()
+	var wg sync.WaitGroup
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			task := &Task{
+				ID:    "task-" + strconv.Itoa(i),
+				Arg1:  float64(i),
+				Arg2:  float64(i),
+				Operation: "+",
+			}
+
+			storage.Lock()
+			storage.Tasks[task.ID] = task
+			storage.PendingTasks = append(storage.PendingTasks, task.ID)
+			storage.Unlock()
+		}(i)
+	}
+
+	wg.Wait()
+
+	if len(storage.Tasks) != 100 || len(storage.PendingTasks) != 100 {
+		t.Errorf("Concurrency issue: tasks=%d, pending=%d", 
+			len(storage.Tasks), len(storage.PendingTasks))
+	}
+}
+
+func TestMain(m *testing.M) {
+	timeAddition = 0
+	timeSubtraction = 0
+	timeMultiplication = 0
+	timeDivision = 0
+
+	code := m.Run()
+
+	os.Exit(code)
+}
