@@ -11,6 +11,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"bytes"
+        "net/http/httptest"
+        "testing"
 )
 
 var (
@@ -585,6 +588,10 @@ func getArgValue(arg interface{}) (float64, error) {
 func main() {
 	orchestrator := NewOrchestrator()
 	go orchestrator.Start("8080")
+        time.Sleep(100 * time.Millisecond) // Даем время оркестратору запуститься
+        agent := NewAgent("http://localhost:8080", computingPower)
+        agent.Start()
+
 
 	computingPower := 4
 	if val, exists := os.LookupEnv("COMPUTING_POWER"); exists {
