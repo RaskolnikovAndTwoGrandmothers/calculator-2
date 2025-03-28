@@ -4,7 +4,7 @@
 
 Склонируйте репозитории:
 
-git-клон https://github.com/RaskolnikovAndTwoGrandmothers/calc2.git
+git-клон https://github.com/RaskolnikovAndTwoGrandmothers/calculator-2
 
 Настройте параметры для агента:
 
